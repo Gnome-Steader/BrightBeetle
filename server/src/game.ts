@@ -562,7 +562,7 @@ export class Game implements GameData {
         this.pluginManager.emit("game_tick", this);
 
         if (!this._stopped) {
-            setTimeout(this.tick.bind(this), this.idealDt - (Date.now() - now));
+            setTimeout(this.tick.bind(this), Math.max(0, this.idealDt - (Date.now() - now)));
         }
     }
 

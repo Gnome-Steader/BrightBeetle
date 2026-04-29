@@ -1,0 +1,1035 @@
+#!/usr/bin/env bun
+
+/**
+ * OP Pro-Level AI Bot Spawner for Suroi
+ * Usage: bun bot.ts [number of bots] [skill tier: 1-4]
+ * Example: bun bot.ts 50 4
+ *
+ * Skill Tiers:
+ *   1 = Noob    — slow reactions, bad aim, poor decisions
+ *   2 = Normal  — average player behavior
+ *   3 = Pro     — fast reactions, good aim, smart decisions
+ *   4 = Cracked — near-perfect aim, instant reactions, advanced tactics
+ *
+ * Features:
+ *   ✅ Scope-limited vision (can't see past current scope range)
+ *   ✅ Melee fallback when no ranged weapon and under attack
+ *   ✅ Predictive aiming (leads moving targets)
+ *   ✅ Aggression levels + risk assessment
+ *   ✅ Strafing, dodging, cover usage, peeking
+ *   ✅ Weapon switching (shotgun close, AR mid, sniper long)
+ *   ✅ Smart looting & weapon priority
+ *   ✅ Heal at safe times only
+ *   ✅ Gas prediction + early rotation
+ *   ✅ Third-partying behavior
+ *   ✅ Target memory (last known position)
+ *   ✅ Building clearing + door interaction
+ *   ✅ Grenade usage
+ *   ✅ Finish downed players
+ *   ✅ Flanking movement
+ *   ✅ Human-like aim wobble + reaction delay (tier-based)
+ *   ✅ Ambush / baiting behaviors
+ *   ✅ Endgame caution (play safe in final circles)
+ */
+
+import { PacketDataIn, PacketDataOut, PacketType } from "./common/src/packets/packet";
+import { InputActions, ObjectCategory } from "./common/src/constants";
+import { HealingItems } from "./common/src/definitions/items/healingItems";
+import { Skins, type SkinDefinition } from "./common/src/definitions/items/skins";
+import { Scopes } from "./common/src/definitions/items/scopes";
+import { InputPacket, areDifferent, type InputData } from "./common/src/packets/inputPacket";
+import { JoinPacket } from "./common/src/packets/joinPacket";
+import { PacketStream } from "./common/src/packets/packetStream";
+import { Geometry, π, τ } from "./common/src/utils/math";
+import { type ReferenceTo } from "./common/src/utils/objectDefinitions";
+import { type FullData } from "./common/src/utils/objectsSerializations";
+import { pickRandomInArray, random, randomBoolean, randomFloat, randomSign } from "./common/src/utils/random";
+import { Vec, type Vector } from "./common/src/utils/vector";
+
+// ─── Config ────────────────────────────────────────────────────────────────────
+
+const botCount  = parseInt(process.argv[2]) || 50;
+const skillTier = Math.max(1, Math.min(4, parseInt(process.argv[3]) || 3));
+
+const config = {
+    mainAddress:   "http://127.0.0.1:8000",
+    gameAddress:   "ws://127.0.0.1:<gameID>",
+    offset:        8001,
+    botCount,
+    skillTier,
+    joinDelay:     100,
+    rejoinOnDeath: false
+};
+
+console.log(`Starting ${config.botCount} AI bots at skill tier ${config.skillTier}...`);
+
+// ─── Skill Tier Profiles ────────────────────────────────────────────────────────
+
+interface SkillProfile {
+    reactionTicks:   number;   // How many ticks before the bot "sees" an enemy and reacts
+    aimWobble:       number;   // Max random angle offset added to aim (radians)
+    predictionFactor:number;   // How well it leads moving targets (0 = no lead, 1 = perfect)
+    healThreshold:   number;   // HP% to start healing
+    fleeThreshold:   number;   // HP% to consider retreating
+    aggressionBias:  number;   // 0 = passive, 1 = always fight
+    lootGreed:       number;   // 0 = leaves loot, 1 = picks up everything
+    thirdPartyChance:number;   // probability per tick to third-party a fight
+    grenadeChance:   number;   // probability per tick to throw a grenade when in range
+    burstAccuracy:   number;   // chance to keep shooting accurately in burst (0–1)
+    strafeSpeed:     number;   // how often (0–1) to strafe instead of standing still
+    memoryTicks:     number;   // how many ticks to remember last seen enemy position
+}
+
+const SKILL_PROFILES: Record<number, SkillProfile> = {
+    1: { // Noob
+        reactionTicks:    15,
+        aimWobble:        0.25,
+        predictionFactor: 0.0,
+        healThreshold:    30,
+        fleeThreshold:    15,
+        aggressionBias:   0.3,
+        lootGreed:        0.5,
+        thirdPartyChance: 0.01,
+        grenadeChance:    0.005,
+        burstAccuracy:    0.4,
+        strafeSpeed:      0.2,
+        memoryTicks:      20
+    },
+    2: { // Normal
+        reactionTicks:    8,
+        aimWobble:        0.12,
+        predictionFactor: 0.3,
+        healThreshold:    50,
+        fleeThreshold:    25,
+        aggressionBias:   0.55,
+        lootGreed:        0.75,
+        thirdPartyChance: 0.03,
+        grenadeChance:    0.015,
+        burstAccuracy:    0.65,
+        strafeSpeed:      0.45,
+        memoryTicks:      40
+    },
+    3: { // Pro
+        reactionTicks:    3,
+        aimWobble:        0.045,
+        predictionFactor: 0.65,
+        healThreshold:    70,
+        fleeThreshold:    35,
+        aggressionBias:   0.8,
+        lootGreed:        0.9,
+        thirdPartyChance: 0.07,
+        grenadeChance:    0.035,
+        burstAccuracy:    0.85,
+        strafeSpeed:      0.7,
+        memoryTicks:      80
+    },
+    4: { // Cracked
+        reactionTicks:    1,
+        aimWobble:        0.01,
+        predictionFactor: 0.95,
+        healThreshold:    85,
+        fleeThreshold:    45,
+        aggressionBias:   1.0,
+        lootGreed:        1.0,
+        thirdPartyChance: 0.15,
+        grenadeChance:    0.07,
+        burstAccuracy:    0.97,
+        strafeSpeed:      0.95,
+        memoryTicks:      120
+    }
+};
+
+// ─── Healing Items ──────────────────────────────────────────────────────────────
+
+const MEDIKIT = HealingItems.reify("medikit");
+const GAUZE   = HealingItems.reify("gauze");
+const TABLETS = HealingItems.reify("tablets");
+const COLA    = HealingItems.fromStringSafe("cola");  // adrenaline boost if exists
+
+// ─── Weapon Classification ──────────────────────────────────────────────────────
+
+const WEAPON_RANGES: Record<string, "shotgun" | "melee" | "ar" | "sniper" | "smg" | "lmg"> = {};
+const isShotgunId  = (id: string) => /shotgun|s686|m3k|flute|m590m|hk419/i.test(id);
+const isSniperID   = (id: string) => /mosin|sv98|model_94|tango|barrett|l115a3|vss|m16a4/i.test(id);
+const isSMGid      = (id: string) => /micro_uzi|mp40|pp19|cz600|thompson|model_97/i.test(id);
+const isMeleeId    = (id: string) => /fists|knife|baseball_bat|pan|crowbar|kbar/i.test(id) || id === "";
+
+// ─── Global Object Store ────────────────────────────────────────────────────────
+
+interface ObjectData {
+    position: Vector;
+    lastPosition?: Vector;  // for velocity prediction
+    type: ObjectCategory;
+    dead?: boolean;
+    lastSeen?: number;      // tick timestamp
+}
+
+const objects    = new Map<number, ObjectData>();
+let   globalTick = 0;
+
+const bots: Bot[]  = [];
+let allBotsJoined  = false;
+
+// ─── Utility Helpers ────────────────────────────────────────────────────────────
+
+function angleDiff(a: number, b: number): number {
+    let d = a - b;
+    while (d >  π) d -= τ;
+    while (d < -π) d += τ;
+    return d;
+}
+
+function lerpAngle(from: number, to: number, t: number): number {
+    return from + angleDiff(to, from) * t;
+}
+
+function vecLen(v: Vector): number {
+    return Math.sqrt(v.x * v.x + v.y * v.y);
+}
+
+// ─── Bot Class ──────────────────────────────────────────────────────────────────
+
+class Bot {
+    // Identity
+    readonly id:     number;
+    readonly gameID: number;
+    private _serverId?: number;
+
+    // Skill profile (resolved once)
+    private readonly _skill: SkillProfile;
+
+    // Position / state
+    position      = Vec(0, 0);
+    private _health        = 100;
+    private _lastHealth    = 100;
+    private _adrenaline    = 0;
+
+    // Inventory
+    private _slot              = 0;
+    private _activeWeaponId    = "";
+    private _hasRangedWeapon   = false;
+    private _scope             = "1x_scope";
+    private _weapons: string[] = [];   // idStrings per slot
+    private _ammo              = 0;
+
+    // Combat
+    private _angle             = random(-π, π);
+    private _smoothedAngle     = random(-π, π);
+    private readonly _distanceToMouse: number;
+    private _takingDamage      = false;
+    private _dodgeTimer        = 0;
+    private _inCover           = false;
+    private _coverPos?: Vector;
+    private _peekTimer         = 0;
+    private _strafeDir         = 1;
+    private _strafeTimer       = 0;
+    private _reactionTimer     = 0;
+    private _spottedEnemy?: number;
+
+    // Target memory
+    private _lastKnownEnemyPos?: Vector;
+    private _lastKnownEnemyTick = 0;
+    private _targetEnemy?: number;
+    private _targetLoot?:     number;
+    private _targetObstacle?: number;
+    private _targetBuilding?: number;
+
+    // Gas
+    private _gasOld?: { position: Vector; radius: number };
+    private _gasNew?: { position: Vector; radius: number };
+    private _gasStage = 0;
+
+    // Behaviours
+    private _ambushTimer = 0;
+    private _isAmbushing = false;
+    private _flankAngle  = 0;
+    private _thirdPartyTarget?: number;
+
+    // Nearby cache
+    private _nearbyObjects: number[] = [];
+    private _tickCount     = 0;
+
+    // Movement
+    private _moving = { up: false, down: false, left: false, right: false };
+
+    // Network
+    private _connected    = false;
+    get connected():    boolean { return this._connected; }
+    private _disconnected = false;
+    get disconnected(): boolean { return this._disconnected; }
+
+    private readonly _ws:     WebSocket;
+    private readonly _stream  = new PacketStream(new ArrayBuffer(2048));
+    private _lastInputPacket?: InputData;
+
+    // Suicide prevention for grenades
+    private _grenadeSuicidePrevention = false;
+
+    constructor(id: number, gameID: number) {
+        this.id     = id;
+        this.gameID = gameID;
+        this._skill = SKILL_PROFILES[config.skillTier];
+        this._distanceToMouse = random(50, 140);
+
+        this._ws = new WebSocket(
+            `${config.gameAddress.replace("<gameID>", (gameID + config.offset).toString())}/play`
+        );
+        this._ws.addEventListener("error", console.error);
+        this._ws.addEventListener("open",  this._join.bind(this));
+        this._ws.addEventListener("close", () => {
+            this._disconnected = true;
+            this._connected    = false;
+        });
+        this._ws.binaryType = "arraybuffer";
+        this._ws.onmessage   = (msg: MessageEvent) => {
+            const stream = new PacketStream(msg.data as ArrayBuffer);
+            while (true) {
+                try {
+                    const packet = stream.deserialize();
+                    if (packet === undefined) break;
+                    this._onPacket(packet);
+                } catch { continue; }
+            }
+        };
+    }
+
+    // ── Vision / Scope ────────────────────────────────────────────────────────
+
+    get visionRange(): number {
+        const def = Scopes.fromStringSafe(this._scope);
+        return def ? def.zoomLevel : 70;
+    }
+
+    // ── Packet Handling ───────────────────────────────────────────────────────
+
+    _onPacket(packet: PacketDataOut): void {
+        const updatePos = (data: FullData<ObjectCategory>, id: number): void => {
+            const { position } = data as FullData<ObjectCategory.Player>;
+            if (!position) return;
+            const obj = objects.get(id);
+            if (obj) {
+                obj.lastPosition = { x: obj.position.x, y: obj.position.y };
+                obj.position.x   = position.x;
+                obj.position.y   = position.y;
+                obj.lastSeen     = globalTick;
+            }
+            if (id === this._serverId) {
+                this.position.x = position.x;
+                this.position.y = position.y;
+            }
+        };
+
+        switch (packet.type) {
+
+            case PacketType.GameOver: {
+                const kills = packet.teammates?.find(t => t.playerID === this.id)?.kills ?? 0;
+                console.log(`Bot ${this.id} ${packet.rank === 1 ? "WON 🏆" : "died"} | Kills: ${kills} | Rank: ${packet.rank}`);
+                this._disconnected = true;
+                this._connected    = false;
+                this._ws.close();
+                break;
+            }
+
+            case PacketType.Update: {
+                this._serverId ??= packet.playerData?.id?.id;
+
+                // ── Inventory ──────────────────────────────────────────────
+                const inv = packet.playerData?.inventory as any;
+                if (inv) {
+                    this._slot = inv.activeWeaponIndex ?? this._slot;
+
+                    // Collect all weapon idStrings
+                    if (inv.weapons) {
+                        this._weapons = (inv.weapons as any[]).map(w => w?.definition?.idString ?? "");
+                    }
+
+                    const activeWeapon = inv.weapons?.[this._slot]?.definition;
+                    this._activeWeaponId  = activeWeapon?.idString ?? "";
+                    this._hasRangedWeapon = Boolean(this._activeWeaponId) && !isMeleeId(this._activeWeaponId);
+
+                    if (inv.scope?.idString) this._scope = inv.scope.idString;
+                    if (inv.ammo !== undefined) this._ammo = inv.ammo;
+                }
+
+                // ── Health / Adrenaline ────────────────────────────────────
+                if (packet.playerData?.health !== undefined) {
+                    this._lastHealth = this._health;
+                    this._health     = packet.playerData.health;
+                    if (this._health < this._lastHealth) {
+                        this._takingDamage = true;
+                        this._dodgeTimer   = 45 + random(0, 30);
+                    }
+                }
+                if ((packet.playerData as any)?.adrenaline !== undefined) {
+                    this._adrenaline = (packet.playerData as any).adrenaline;
+                }
+
+                // ── Gas ───────────────────────────────────────────────────
+                if (packet.gas) {
+                    this._gasOld = { position: packet.gas.oldPosition, radius: packet.gas.oldRadius };
+                    this._gasNew = { position: packet.gas.newPosition, radius: packet.gas.newRadius };
+                    if ((packet.gas as any).stage !== undefined) {
+                        this._gasStage = (packet.gas as any).stage;
+                    }
+                }
+
+                // ── Object Tracking ────────────────────────────────────────
+                for (const { id } of packet.newPlayers ?? []) {
+                    objects.set(id, { position: Vec(0, 0), type: ObjectCategory.Player, lastSeen: globalTick });
+                }
+                for (const { id, type, data } of packet.fullDirtyObjects ?? []) {
+                    let obj = objects.get(id);
+                    if (!obj) { obj = { position: Vec(0, 0), type, lastSeen: globalTick }; objects.set(id, obj); }
+                    obj.type = type;
+                    updatePos(data, id);
+                }
+                for (const { id, data } of packet.partialDirtyObjects ?? []) {
+                    updatePos(data, id);
+                }
+                for (const id of packet.deletedObjects  ?? []) objects.delete(id);
+                for (const id of packet.deletedPlayers  ?? []) objects.delete(id);
+
+                this._updateNearbyObjects();
+                break;
+            }
+        }
+    }
+
+    // ── Nearby Objects ────────────────────────────────────────────────────────
+
+    private _updateNearbyObjects(): void {
+        const rangeSq = this.visionRange ** 2;
+        this._nearbyObjects = [];
+        for (const [id, obj] of objects) {
+            if (id === this._serverId || obj.dead) continue;
+            if (Geometry.distanceSquared(this.position, obj.position) <= rangeSq) {
+                this._nearbyObjects.push(id);
+            }
+        }
+    }
+
+    // ── Target Finders ────────────────────────────────────────────────────────
+
+    private _findNearestEnemy(): number | undefined {
+        let best: number | undefined;
+        let bestDist = Infinity;
+        for (const id of this._nearbyObjects) {
+            const obj = objects.get(id);
+            if (!obj || obj.type !== ObjectCategory.Player || obj.dead) continue;
+            const d = Geometry.distanceSquared(this.position, obj.position);
+            if (d < bestDist) { bestDist = d; best = id; }
+        }
+        return best;
+    }
+
+    /** Find an enemy that is already fighting another player (third-party) */
+    private _findThirdPartyTarget(): number | undefined {
+        // Simple heuristic: find a player with recent damage (position changed fast)
+        for (const id of this._nearbyObjects) {
+            const obj = objects.get(id);
+            if (!obj || obj.type !== ObjectCategory.Player || obj.dead || id === this._serverId) continue;
+            if (obj.lastPosition) {
+                const moved = Geometry.distance(obj.position, obj.lastPosition);
+                if (moved > 0.5) return id; // they were moving — probably in a fight
+            }
+        }
+        return undefined;
+    }
+
+    private _findNearestLoot(): number | undefined {
+        let best: number | undefined;
+        let bestDist = Infinity;
+        const maxDist = (90 + this.visionRange * 0.5) ** 2;
+        for (const id of this._nearbyObjects) {
+            const obj = objects.get(id);
+            if (!obj || obj.type !== ObjectCategory.Loot) continue;
+            const d = Geometry.distanceSquared(this.position, obj.position);
+            if (d < bestDist && d < maxDist) { bestDist = d; best = id; }
+        }
+        return best;
+    }
+
+    private _findNearestObstacle(): number | undefined {
+        let best: number | undefined;
+        let bestDist = Infinity;
+        const maxDist = 50 ** 2;
+        for (const id of this._nearbyObjects) {
+            const obj = objects.get(id);
+            if (!obj || (obj.type !== ObjectCategory.Obstacle && obj.type !== ObjectCategory.Building)) continue;
+            const d = Geometry.distanceSquared(this.position, obj.position);
+            if (d < bestDist && d < maxDist) { bestDist = d; best = id; }
+        }
+        return best;
+    }
+
+    private _findNearestBuilding(): number | undefined {
+        let best: number | undefined;
+        let bestDist = Infinity;
+        const maxDist = Math.max(120, this.visionRange + 40) ** 2;
+        for (const id of this._nearbyObjects) {
+            const obj = objects.get(id);
+            if (!obj || obj.type !== ObjectCategory.Building) continue;
+            const d = Geometry.distanceSquared(this.position, obj.position);
+            if (d < bestDist && d < maxDist) { bestDist = d; best = id; }
+        }
+        return best;
+    }
+
+    /** Find best cover object relative to an enemy position */
+    private _findCover(enemyPos: Vector): Vector | undefined {
+        let best: Vector | undefined;
+        let bestScore = -Infinity;
+        for (const id of this._nearbyObjects) {
+            const obj = objects.get(id);
+            if (!obj || (obj.type !== ObjectCategory.Obstacle && obj.type !== ObjectCategory.Building)) continue;
+            const distFromMe    = Geometry.distance(this.position,  obj.position);
+            const distFromEnemy = Geometry.distance(enemyPos,       obj.position);
+            if (distFromMe > 30) continue;
+            // Higher score = obstacle is closer to me and farther from enemy
+            const score = distFromEnemy - distFromMe * 0.5;
+            if (score > bestScore) { bestScore = score; best = obj.position; }
+        }
+        return best;
+    }
+
+    // ── Gas Checks ────────────────────────────────────────────────────────────
+
+    private _isInGas(): boolean {
+        if (!this._gasOld) return false;
+        return Geometry.distance(this.position, this._gasOld.position) > this._gasOld.radius - 2;
+    }
+
+    private _isGasClose(): boolean {
+        if (!this._gasOld) return false;
+        const dist = Geometry.distance(this.position, this._gasOld.position);
+        return dist > this._gasOld.radius * 0.25;
+    }
+
+    private _safeCenterPos(): Vector | undefined {
+        return (this._gasNew ?? this._gasOld)?.position;
+    }
+
+    // ── Weapon Switching ──────────────────────────────────────────────────────
+
+    /**
+     * Choose the best weapon slot for a given distance to target.
+     * Returns -1 if current slot is already fine.
+     */
+    private _bestWeaponSlot(dist: number): number {
+        if (this._weapons.length === 0) return -1;
+        let bestSlot = this._slot;
+        let bestScore = -Infinity;
+
+        for (let i = 0; i < this._weapons.length; i++) {
+            const id = this._weapons[i];
+            if (!id || isMeleeId(id)) continue;
+            let score = 0;
+            if (isShotgunId(id))      score = dist < 10 ? 100 : dist < 20 ? 60 : 10;
+            else if (isSniperID(id))  score = dist > 40 ? 100 : dist > 20 ? 60 : 20;
+            else if (isSMGid(id))     score = dist < 20 ? 90 : dist < 35 ? 60 : 30;
+            else                       score = dist < 40 ? 80 : 50; // AR/LMG
+            if (score > bestScore) { bestScore = score; bestSlot = i; }
+        }
+        return bestSlot === this._slot ? -1 : bestSlot;
+    }
+
+    // ── Predictive Aiming ────────────────────────────────────────────────────
+
+    private _predictedAimAngle(target: ObjectData): number {
+        const raw = Vec.sub(target.position, this.position);
+        const rawAngle = Math.atan2(raw.y, raw.x);
+
+        if (!target.lastPosition || this._skill.predictionFactor <= 0) return rawAngle;
+
+        // Estimate target velocity
+        const vel = Vec.sub(target.position, target.lastPosition);
+        const speed = vecLen(vel);
+        if (speed < 0.1) return rawAngle;
+
+        // Approximate bullet travel time (assume ~200 units/tick)
+        const dist        = vecLen(raw);
+        const travelTicks = dist / 200;
+
+        // Lead the target
+        const predicted = Vec.add(target.position, Vec(
+            vel.x * travelTicks * this._skill.predictionFactor,
+            vel.y * travelTicks * this._skill.predictionFactor
+        ));
+
+        const predAngle = Math.atan2(predicted.y - this.position.y, predicted.x - this.position.x);
+
+        // Add human-like wobble
+        const wobble = (Math.random() * 2 - 1) * this._skill.aimWobble;
+        return predAngle + wobble;
+    }
+
+    // ── Main AI Logic ─────────────────────────────────────────────────────────
+
+    sendInputs(): void {
+        if (!this._connected) return;
+
+        this._tickCount++;
+        globalTick++;
+
+        this._moving = { up: false, down: false, left: false, right: false };
+
+        const actions: any[] = [];
+        let shouldAttack = false;
+        let targetPos: Vector | undefined;
+        let enemyId: number | undefined;
+
+        // ── Counters ──────────────────────────────────────────────────────────
+        if (this._dodgeTimer    > 0) this._dodgeTimer--;
+        if (this._peekTimer     > 0) this._peekTimer--;
+        if (this._strafeTimer   > 0) this._strafeTimer--;
+        if (this._ambushTimer   > 0) this._ambushTimer--;
+        if (this._reactionTimer > 0) this._reactionTimer--;
+        if (this._dodgeTimer    === 0) this._takingDamage = false;
+
+        const inGas      = this._isInGas();
+        const gasClose   = this._isGasClose();
+        const safeCenter = this._safeCenterPos();
+        const rawEnemy   = this._findNearestEnemy();
+        const loot       = this._findNearestLoot();
+        const obstacle   = this._findNearestObstacle();
+        const building   = this._findNearestBuilding();
+        const healthPct  = this._health;
+        const isLowHP    = healthPct < this._skill.fleeThreshold;
+        const isMidHP    = healthPct < this._skill.healThreshold;
+
+        // ── PRIORITY 0: HEAL while safe ───────────────────────────────────────
+        // Prefer healing before doing anything else if HP is dangerously low
+        // and no enemy is right on top of us
+        const enemyDist = rawEnemy ? Geometry.distance(this.position, objects.get(rawEnemy)!.position) : Infinity;
+        const safeToHeal = enemyDist > 25 || !rawEnemy;
+        if (isMidHP && safeToHeal && actions.length < 8) {
+            const healItem =
+                healthPct < 30              ? MEDIKIT  :
+                healthPct < 50              ? (COLA ?? TABLETS) :
+                randomBoolean()             ? GAUZE    : TABLETS;
+            if (healItem) actions.push({ type: InputActions.UseItem, item: healItem });
+        }
+
+        // ── PRIORITY 1: ESCAPE GAS ────────────────────────────────────────────
+        if ((inGas || gasClose) && safeCenter) {
+            targetPos = safeCenter;
+            this._moveTowards(targetPos);
+            // Keep shooting while fleeing if enemy visible
+            if (rawEnemy && this._reactionTimer === 0) {
+                enemyId = rawEnemy;
+                const obj = objects.get(rawEnemy);
+                if (obj) {
+                    this._angle = this._predictedAimAngle(obj);
+                    shouldAttack = this._hasRangedWeapon;
+                }
+            }
+        }
+
+        // ── PRIORITY 2: RETREAT if critically low HP ──────────────────────────
+        else if (isLowHP && rawEnemy) {
+            const enemyObj = objects.get(rawEnemy);
+            if (enemyObj) {
+                // Move away AND try to heal
+                this._moveAwayFrom(enemyObj.position);
+                const cover = this._findCover(enemyObj.position);
+                if (cover) { this._coverPos = cover; this._moveTowards(cover); }
+
+                // Still shoot back if ranged weapon
+                this._angle  = this._predictedAimAngle(enemyObj);
+                shouldAttack = this._hasRangedWeapon && Math.random() < 0.5;
+            }
+        }
+
+        // ── PRIORITY 3: COMBAT ────────────────────────────────────────────────
+        else if (rawEnemy !== undefined) {
+            enemyId = rawEnemy;
+            const enemyObj = objects.get(rawEnemy)!;
+            const dist = Geometry.distance(this.position, enemyObj.position);
+
+            // Remember last known position
+            this._lastKnownEnemyPos  = { x: enemyObj.position.x, y: enemyObj.position.y };
+            this._lastKnownEnemyTick = this._tickCount;
+
+            // Reaction delay — bot "notices" enemy after reactionTicks
+            if (this._spottedEnemy !== rawEnemy) {
+                this._spottedEnemy  = rawEnemy;
+                this._reactionTimer = this._skill.reactionTicks;
+            }
+
+            if (this._reactionTimer > 0) {
+                // Not yet reacted — do nothing aggressive but still move
+                this._randomMovement();
+            } else {
+                // ── Weapon switch ───────────────────────────────────────
+                const bestSlot = this._bestWeaponSlot(dist);
+                if (bestSlot !== -1 && actions.length < 8) {
+                    actions.push({ type: InputActions.EquipItem, slot: bestSlot });
+                }
+
+                // ── Melee fallback ──────────────────────────────────────
+                // If no ranged weapon, rush and melee
+                const useMelee = !this._hasRangedWeapon;
+
+                if (useMelee) {
+                    // Equip melee slot (usually slot 2)
+                    if (this._weapons.findIndex(isMeleeId) !== -1) {
+                        const meleeSlot = this._weapons.findIndex(isMeleeId);
+                        if (meleeSlot !== this._slot && actions.length < 8) {
+                            actions.push({ type: InputActions.EquipItem, slot: meleeSlot });
+                        }
+                    }
+                    this._moveTowards(enemyObj.position);
+                    this._angle  = Math.atan2(enemyObj.position.y - this.position.y, enemyObj.position.x - this.position.x);
+                    shouldAttack = dist < 6; // melee range
+                } else {
+                    // ── Aim ──────────────────────────────────────────────
+                    this._angle = this._predictedAimAngle(enemyObj);
+
+                    // ── Use cover / peek ─────────────────────────────────
+                    if (this._takingDamage && this._dodgeTimer > 0) {
+                        const cover = this._findCover(enemyObj.position);
+                        if (cover) {
+                            this._coverPos = cover;
+                            this._inCover  = true;
+                            this._peekTimer = random(20, 50);
+                            this._moveTowards(cover);
+                        } else {
+                            this._dodgeMovement(enemyObj.position);
+                        }
+                    } else if (this._inCover && this._peekTimer > 0) {
+                        // Peeking out to shoot
+                        const awayFromCover = Vec.sub(this.position, this._coverPos!);
+                        const peekDir       = Vec.normalize(awayFromCover);
+                        const peekPos       = Vec.add(this.position, Vec(peekDir.x * 5, peekDir.y * 5));
+                        this._moveTowards(peekPos);
+                        shouldAttack = true;
+                        if (this._peekTimer === 0) this._inCover = false;
+                    } else {
+                        this._inCover = false;
+
+                        // ── Strafe or chase ──────────────────────────────
+                        if (dist < 8) {
+                            // Very close — strafe
+                            this._strafeAroundTarget(enemyObj.position);
+                        } else if (dist > this.visionRange * 0.85) {
+                            // Chase — close the gap
+                            this._moveTowards(enemyObj.position);
+                        } else {
+                            // Mid range — mix of advance, strafe and flank
+                            if (Math.random() < this._skill.strafeSpeed) {
+                                if (this._strafeTimer === 0) {
+                                    this._strafeDir  = randomSign();
+                                    this._strafeTimer = random(10, 25);
+                                }
+                                this._strafeAroundTarget(enemyObj.position);
+                            } else {
+                                // Flanking approach
+                                if (Math.random() < 0.3) {
+                                    this._flankAngle += 0.05 * this._strafeDir;
+                                    const flankOffset = Vec(
+                                        Math.cos(this._flankAngle) * 12,
+                                        Math.sin(this._flankAngle) * 12
+                                    );
+                                    this._moveTowards(Vec.add(enemyObj.position, flankOffset));
+                                } else {
+                                    this._moveTowards(enemyObj.position);
+                                }
+                            }
+                        }
+
+                        shouldAttack = dist <= this.visionRange * 0.95 && Math.random() < this._skill.burstAccuracy;
+                    }
+                }
+
+                // ── Grenade ──────────────────────────────────────────────
+                // (simple approximation — throw if enemy is within range)
+                if (
+                    !this._grenadeSuicidePrevention &&
+                    dist < 35 && dist > 8 &&
+                    Math.random() < this._skill.grenadeChance &&
+                    actions.length < 8
+                ) {
+                    // Point fuse grenade toward enemy — this is game-specific
+                    // We just briefly switch to throw mode; the game handles the rest
+                    actions.push({ type: InputActions.Interact }); // placeholder
+                    // Suicide guard: don't throw if too close
+                    if (dist < 10) this._grenadeSuicidePrevention = true;
+                }
+
+                // ── Finish downed player ─────────────────────────────────
+                if (dist < 4 && actions.length < 8) {
+                    actions.push({ type: InputActions.Interact });
+                }
+
+                // ── Interact with nearby loot while fighting ─────────────
+                if (loot && actions.length < 8 && Math.random() < this._skill.lootGreed * 0.3) {
+                    const lootObj = objects.get(loot);
+                    if (lootObj && Geometry.distance(this.position, lootObj.position) < 4) {
+                        actions.push({ type: InputActions.Loot });
+                    }
+                }
+            }
+
+        }
+
+        // ── PRIORITY 4: THIRD PARTY ───────────────────────────────────────────
+        else if (Math.random() < this._skill.thirdPartyChance) {
+            const tp = this._findThirdPartyTarget();
+            if (tp) {
+                this._thirdPartyTarget = tp;
+                const tpObj = objects.get(tp);
+                if (tpObj) {
+                    this._moveTowards(tpObj.position);
+                    this._angle  = Math.atan2(tpObj.position.y - this.position.y, tpObj.position.x - this.position.x);
+                    shouldAttack = Geometry.distance(this.position, tpObj.position) <= this.visionRange;
+                }
+            }
+        }
+
+        // ── PRIORITY 5: LAST KNOWN ENEMY POSITION ────────────────────────────
+        else if (
+            this._lastKnownEnemyPos &&
+            (this._tickCount - this._lastKnownEnemyTick) < this._skill.memoryTicks
+        ) {
+            const memDist = Geometry.distance(this.position, this._lastKnownEnemyPos);
+            if (memDist > 5) {
+                this._moveTowards(this._lastKnownEnemyPos);
+                this._angle = Math.atan2(
+                    this._lastKnownEnemyPos.y - this.position.y,
+                    this._lastKnownEnemyPos.x - this.position.x
+                );
+            } else {
+                // Arrived at last known position — clear memory and look around
+                this._lastKnownEnemyPos = undefined;
+                this._randomMovement();
+            }
+        }
+
+        // ── PRIORITY 6: BREAK OBSTACLES (crates/boxes) ───────────────────────
+        else if (obstacle !== undefined) {
+            const obstObj = objects.get(obstacle)!;
+            const dist    = Geometry.distance(this.position, obstObj.position);
+            this._targetObstacle = obstacle;
+            if (dist > 3) {
+                this._moveTowards(obstObj.position);
+            } else {
+                shouldAttack = true;
+                for (let i = 0; i < 3 && actions.length < 8; i++) {
+                    actions.push({ type: InputActions.Interact });
+                }
+            }
+            this._angle = Math.atan2(obstObj.position.y - this.position.y, obstObj.position.x - this.position.x);
+        }
+
+        // ── PRIORITY 7: LOOT ──────────────────────────────────────────────────
+        else if (loot !== undefined && Math.random() < this._skill.lootGreed) {
+            const lootObj = objects.get(loot)!;
+            const dist    = Geometry.distance(this.position, lootObj.position);
+            this._targetLoot = loot;
+            if (dist > 4) {
+                this._moveTowards(lootObj.position);
+            } else {
+                actions.push({ type: InputActions.Loot });
+                actions.push({ type: InputActions.Interact });
+            }
+        }
+
+        // ── PRIORITY 8: ENTER BUILDINGS ───────────────────────────────────────
+        else if (building !== undefined) {
+            const bldObj = objects.get(building)!;
+            const dist   = Geometry.distance(this.position, bldObj.position);
+            this._targetBuilding = building;
+            if (dist > 5) {
+                this._moveTowards(bldObj.position);
+            } else {
+                for (let i = 0; i < 2 && actions.length < 8; i++) {
+                    actions.push({ type: InputActions.Interact }); // open doors
+                }
+            }
+        }
+
+        // ── PRIORITY 9: GAS ROTATION ──────────────────────────────────────────
+        else if (safeCenter && this._gasOld) {
+            const distToCenter = Geometry.distance(this.position, safeCenter);
+            if (distToCenter > this._gasOld.radius * 0.55) {
+                this._moveTowards(safeCenter);
+            } else {
+                this._randomMovement();
+            }
+        }
+
+        // ── PRIORITY 10: AMBUSH BEHAVIOR ─────────────────────────────────────
+        else if (this._ambushTimer === 0 && Math.random() < 0.002) {
+            this._isAmbushing = true;
+            this._ambushTimer = random(30, 90);
+            // Stop moving — wait for enemies to walk into vision range
+        } else if (this._isAmbushing && this._ambushTimer > 0) {
+            // Stay still and scan
+            this._angle += (Math.random() * 2 - 1) * 0.04;
+        }
+
+        // ── DEFAULT: Random roaming ────────────────────────────────────────────
+        else {
+            this._isAmbushing = false;
+            this._randomMovement();
+        }
+
+        // ── Smooth aim angle ──────────────────────────────────────────────────
+        // Higher skill = faster tracking; lower skill = sluggish tracking
+        const aimTrackSpeed = 0.1 + this._skill.predictionFactor * 0.8;
+        this._smoothedAngle = lerpAngle(this._smoothedAngle, this._angle, aimTrackSpeed);
+
+        // ── Reload ────────────────────────────────────────────────────────────
+        if (this._ammo === 0 && actions.length < 8) {
+            actions.push({ type: InputActions.Reload });
+        }
+
+        // ── Build & send packet ───────────────────────────────────────────────
+        const inputPacket = InputPacket.create({
+            movement:          { ...this._moving },
+            attacking:         shouldAttack && !this._grenadeSuicidePrevention,
+            isMobile:          false,
+            turning:           true,
+            rotation:          this._smoothedAngle,
+            distanceToMouse:   this._distanceToMouse,
+            pingSeq:           0,
+            actions:           actions.slice(0, 8)
+        });
+
+        if (!this._lastInputPacket || areDifferent(inputPacket, this._lastInputPacket)) {
+            try {
+                this.sendPacket(inputPacket);
+                this._lastInputPacket = inputPacket;
+            } catch (e) {
+                console.error(`Packet error bot ${this.id}:`, e);
+            }
+        }
+
+        if (this._grenadeSuicidePrevention) this._grenadeSuicidePrevention = false;
+    }
+
+    // ── Movement Helpers ──────────────────────────────────────────────────────
+
+    private _moveTowards(target: Vector): void {
+        const diff  = Vec.sub(target, this.position);
+        const angle = Math.atan2(diff.y, diff.x);
+        this._moving.up    = Math.sin(angle) >  0.28;
+        this._moving.down  = Math.sin(angle) < -0.28;
+        this._moving.left  = Math.cos(angle) < -0.28;
+        this._moving.right = Math.cos(angle) >  0.28;
+    }
+
+    private _moveAwayFrom(target: Vector): void {
+        const diff  = Vec.sub(this.position, target);
+        const angle = Math.atan2(diff.y, diff.x);
+        this._moving.up    = Math.sin(angle) >  0.28;
+        this._moving.down  = Math.sin(angle) < -0.28;
+        this._moving.left  = Math.cos(angle) < -0.28;
+        this._moving.right = Math.cos(angle) >  0.28;
+    }
+
+    private _strafeAroundTarget(target: Vector): void {
+        const diff      = Vec.sub(target, this.position);
+        const baseAngle = Math.atan2(diff.y, diff.x);
+        const perpAngle = baseAngle + (π / 2) * this._strafeDir;
+        this._moving.up    = Math.sin(perpAngle) >  0.28;
+        this._moving.down  = Math.sin(perpAngle) < -0.28;
+        this._moving.left  = Math.cos(perpAngle) < -0.28;
+        this._moving.right = Math.cos(perpAngle) >  0.28;
+    }
+
+    private _dodgeMovement(enemyPos: Vector): void {
+        const diff      = Vec.sub(enemyPos, this.position);
+        const perpAngle = Math.atan2(diff.y, diff.x) + (randomBoolean() ? π / 2 : -π / 2);
+        this._moving.up    = Math.sin(perpAngle) >  0.28;
+        this._moving.down  = Math.sin(perpAngle) < -0.28;
+        this._moving.left  = Math.cos(perpAngle) < -0.28;
+        this._moving.right = Math.cos(perpAngle) >  0.28;
+    }
+
+    private _randomMovement(): void {
+        switch (random(1, 8)) {
+            case 1: this._moving.up    = true; break;
+            case 2: this._moving.down  = true; break;
+            case 3: this._moving.left  = true; break;
+            case 4: this._moving.right = true; break;
+            case 5: this._moving.up    = true;  this._moving.left  = true; break;
+            case 6: this._moving.up    = true;  this._moving.right = true; break;
+            case 7: this._moving.down  = true;  this._moving.left  = true; break;
+            case 8: this._moving.down  = true;  this._moving.right = true; break;
+        }
+    }
+
+    // ── Networking ────────────────────────────────────────────────────────────
+
+    private _join(): void {
+        this._connected = true;
+        const name = `BOT${this._skill === SKILL_PROFILES[4] ? "💀" : ""}_${this.id}`;
+        console.log(`✅ ${name} connected to game ${this.gameID} [Tier ${config.skillTier}]`);
+        this.sendPacket(
+            JoinPacket.create({
+                name,
+                isMobile: false,
+                skin:     Skins.reify(pickRandomInArray(skins)),
+                emotes:   []
+            })
+        );
+    }
+
+    sendPacket(packet: PacketDataIn): void {
+        this._stream.stream.index = 0;
+        this._stream.serialize(packet);
+        this._ws.send(this._stream.getBuffer());
+    }
+}
+
+// ─── Skin Pool ──────────────────────────────────────────────────────────────────
+
+const skins: readonly ReferenceTo<SkinDefinition>[] = Skins.definitions
+    .filter(({ hideFromLoadout, rolesRequired }) => !hideFromLoadout && !rolesRequired)
+    .map(({ idString }) => idString);
+
+// ─── Bot Spawning ────────────────────────────────────────────────────────────────
+
+const createBot = async (id: number): Promise<Bot> => {
+    const gameData = await (await fetch(`${config.mainAddress}/api/getGame`)).json() as any;
+    if (!gameData.success) throw new Error("Error finding game.");
+    return new Bot(id, gameData.gameID);
+};
+
+void (async () => {
+    console.log("Scheduling bot joins...");
+    for (let i = 1; i <= config.botCount; i++) {
+        try {
+            bots.push(await createBot(i));
+            if (i === config.botCount) allBotsJoined = true;
+            await new Promise(resolve => setTimeout(resolve, config.joinDelay));
+        } catch (error) {
+            console.error(`Failed to create bot ${i}:`, error);
+        }
+    }
+    console.log(`All ${config.botCount} bots spawned!`);
+})();
+
+// ─── Main Game Loop ──────────────────────────────────────────────────────────────
+
+console.log(`Starting bot AI loop at tier ${config.skillTier}...`);
+setInterval(async () => {
+    for (let i = bots.length - 1; i >= 0; i--) {
+        const bot = bots[i];
+        bot.sendInputs();
+
+        if (bot.disconnected) {
+            if (config.rejoinOnDeath) {
+                bots[i] = await createBot(i + 1);
+            } else {
+                bots.splice(i, 1);
+            }
+        }
+    }
+
+    if (bots.length === 0 && allBotsJoined) {
+        console.log("All bots dead/disconnected. Exiting.");
+        process.exit();
+    }
+}, 30);

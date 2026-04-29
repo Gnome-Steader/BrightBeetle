@@ -93,6 +93,9 @@ if (Cluster.isPrimary && require.main === module) {
         port: Config.port,
         routes: {
             "/api/serverInfo": async(req, res) => {
+                if (req.method === "OPTIONS") {
+                    return new Response(null, corsHeaders);
+                }
                 let punishment: PunishmentMessage | undefined;
                 if (new URLSearchParams(req.url.slice(req.url.indexOf("?"))).get("checkPunishments") === "true") {
                     punishment = await getPunishment(getIP(req, res));
@@ -113,6 +116,9 @@ if (Cluster.isPrimary && require.main === module) {
                 }, corsHeaders);
             },
             "/api/getGame": async req => {
+                if (req.method === "OPTIONS") {
+                    return new Response(null, corsHeaders);
+                }
                 let gameID: number | undefined;
                 const teamID = gameManager.teamMode.current !== TeamMode.Solo && getSearchParams(req).get("teamID");
                 if (teamID) {
@@ -129,6 +135,9 @@ if (Cluster.isPrimary && require.main === module) {
                 );
             },
             "/team": async(req, res) => {
+                if (req.method === "OPTIONS") {
+                    return new Response(null, corsHeaders);
+                }
                 const ip = getIP(req, res);
                 const searchParams = getSearchParams(req);
                 let punishmentMessage: string | undefined;

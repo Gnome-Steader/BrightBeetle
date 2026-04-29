@@ -9,6 +9,7 @@
     "dev:client": "cd client && bun dev",
     "dev:server": "cd server && bun dev",
     "dev:test": "cd tests && bun stressTest",
+    "bots": "bun bot.ts",
     "watch:server": "cd server && bunx --bun tsc --noEmit --watch",
     "updateConfigSchema": "cd server && bun updateConfigSchema",
     "lint": "bunx --bun biome lint --fix",
