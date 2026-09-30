@@ -72,7 +72,7 @@
     const meleeActiveKeys = new Set();
     let healingUntil = 0; // timestamp: don't override attacks until this time (healing protection)
 
-           // ==========================================
+                 // ==========================================
     // AGGRESSIVE WIRETAP & SCANNER (Replaces import())
     // ==========================================
     function checkObject(obj, source) {
@@ -85,8 +85,6 @@
         if (!inputRef && obj.attacking !== undefined && obj.rotation !== undefined && obj.movement) {
             inputRef = obj; 
             console.log("%c[CHEAT] InputManager ref OK (via " + source + ")", "color:lime");
-            // PATCH IMMEDIATELY THE MOMENT IT IS FOUND!
-            setupDirectPacketSender();
         }
         if (!cameraRef && obj.zoom !== undefined && obj.position && obj.container && obj.container.scale) {
             cameraRef = obj; 
@@ -100,6 +98,13 @@
             uiManagerRef = obj; 
             console.log("%c[CHEAT] UIManager ref OK (via " + source + ")", "color:lime");
         }
+
+        // 🛡️ CRITICAL FIX: Only attempt to patch when BOTH gameRef and inputRef are ready
+        // AND the patch hasn't been applied yet. This prevents the race condition!
+        if (gameRef && inputRef && !patchApplied) {
+            console.log("%c[CHEAT] ✅ Core refs ready! Applying InputManager patches...", "color: lime; font-weight: bold");
+            setupDirectPacketSender();
+        }
     }
 
     // Deep search helper to find hidden managers inside the Game object
@@ -112,8 +117,8 @@
                     const val = root[key];
                     if (val && typeof val === 'object') {
                         checkObject(val, "deepSearch." + key);
-                        // Keep digging until we find inputRef
-                        if (!inputRef) deepSearch(val, depth + 1);
+                        // Keep digging until we find the missing refs
+                        if (!inputRef || !cameraRef) deepSearch(val, depth + 1);
                     }
                 } catch(e) {}
             }
@@ -145,19 +150,18 @@
     let scanInterval = null;
 
     function startContinuousScan() {
-        if (scanInterval) return; // Already running
-        
+        if (scanInterval) return;
         console.log("%c[CHEAT] 🚀 Starting continuous memory scan...", "color: yellow");
         
         scanInterval = setInterval(() => {
-            // 1. If we already have everything, stop scanning to save performance
-            if (gameRef && inputRef && cameraRef && mapRef && uiManagerRef) {
-                console.log("%c[CHEAT] ✅ All references acquired! Stopping scan.", "color: lime; font-weight: bold");
+            // If we have everything and are patched, stop scanning to save performance
+            if (gameRef && inputRef && cameraRef && mapRef && uiManagerRef && patchApplied) {
+                console.log("%c[CHEAT] ✅ All references acquired and patched! Stopping scan.", "color: lime; font-weight: bold");
                 clearInterval(scanInterval);
                 return;
             }
 
-            // 2. Scan window object for singletons
+            // 1. Scan window object for singletons
             for (const key in window) {
                 try {
                     const obj = window[key];
@@ -167,13 +171,13 @@
                 } catch(e) {}
             }
 
-            // 3. If we have Game but no Input, deep search the Game object
-            if (gameRef && !inputRef) {
+            // 2. If we have Game but no Input/Camera, deep search the Game object
+            if (gameRef && (!inputRef || !cameraRef)) {
                 deepSearch(gameRef);
             }
             
-            // 4. If we have PIXI stage but no Input, deep search the stage
-            if (gameRef && gameRef.pixi && gameRef.pixi.stage && !inputRef) {
+            // 3. If we have PIXI stage but no Input/Camera, deep search the stage
+            if (gameRef && gameRef.pixi && gameRef.pixi.stage && (!inputRef || !cameraRef)) {
                 deepSearch(gameRef.pixi.stage);
             }
 
