@@ -174,6 +174,10 @@
             // 2. If we have Game but no Input/Camera, deep search the Game object
             if (gameRef && (!inputRef || !cameraRef)) {
                 deepSearch(gameRef);
+                // FIX: Direct property checks for forks
+                if (!cameraRef && gameRef.camera) { cameraRef = gameRef.camera; console.log("%c[CHEAT] Camera found at gameRef.camera", "color:cyan"); }
+                if (!mapRef && gameRef.minimap) { mapRef = gameRef.minimap; console.log("%c[CHEAT] Map found at gameRef.minimap", "color:cyan"); }
+                if (!mapRef && gameRef.map) { mapRef = gameRef.map; console.log("%c[CHEAT] Map found at gameRef.map", "color:cyan"); }
             }
             
             // 3. If we have PIXI stage but no Input/Camera, deep search the stage
@@ -197,9 +201,12 @@
     }
     
     // Start the process safely after page load
-    window.addEventListener('load', () => {
-        setTimeout(tryAcquireRefs, 1000);
-    });
+    // FIX: Run immediately if page is already loaded (crucial for pasting into console!)
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        setTimeout(tryAcquireRefs, 500);
+    } else {
+        window.addEventListener('load', () => setTimeout(tryAcquireRefs, 1000));
+    }
 
     // === MONKEY-PATCH InputManager.update() ===
     // THE KEY FIX: inject aimbot/autofire/melee overrides RIGHT BEFORE
@@ -382,9 +389,12 @@
             // SKIP ALL COMBAT OVERRIDES if player is healing
             var healing = isHealingActive();
 
-            if (!healing && mouseIsDown) {
-                // AIMBOT — only when holding a GUN
-                if (CFG.aimbot.enabled && hasAimTarget && isHoldingGun()) {
+            // FIX: Force mouseIsDown to true if Auto-Fire is enabled (bypasses game stealing clicks)
+            let effectiveMouseDown = mouseIsDown || CFG.autoFire.enabled;
+
+            if (!healing && effectiveMouseDown) {
+                // AIMBOT — works with GUNS or MELEE
+                if (CFG.aimbot.enabled && hasAimTarget && (isHoldingGun() || isHoldingMelee())) {
                     shouldOverrideAim = true;
                     targetAngle = aimAngle;
                     targetDist = Math.min(aimDist, 128);
@@ -472,9 +482,12 @@
                 // SKIP ALL OVERRIDES if healing
                 var healing = isHealingActive();
 
-                if (!healing && mouseIsDown) {
-                    // AIMBOT — only when holding a GUN
-                    if (CFG.aimbot.enabled && hasAimTarget && isHoldingGun()) {
+                // FIX: Force mouseIsDown to true if Auto-Fire is enabled
+                let effectiveMouseDown = mouseIsDown || CFG.autoFire.enabled;
+
+                if (!healing && effectiveMouseDown) {
+                    // AIMBOT — works with GUNS or MELEE
+                    if (CFG.aimbot.enabled && hasAimTarget && (isHoldingGun() || isHoldingMelee())) {
                         shouldOverrideAim = true;
                         targetAngle = aimAngle;
                         targetDist = Math.min(aimDist, 128);
