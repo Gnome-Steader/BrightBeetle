@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+
 
 /**
  * CRACKED Ultra-Aggressive AI Bot Spawner for Suroi
